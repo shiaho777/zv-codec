@@ -1,0 +1,25 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+*.zv
+*.swp
+.vscode/
+
+# build artifacts (compile locally with the commands in README)
+*.dylib
+*.so
+*.dll
+*.o
+*.a
+
+# personal test assets
+*.mov
+*.mp4
+*.mkv
+*.webm
+*.avi
+*.m4v
+*.wav
+*.flac
