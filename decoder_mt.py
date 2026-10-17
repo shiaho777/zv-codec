@@ -14,19 +14,31 @@ except ImportError:
     print("need opencv-python: pip install opencv-python")
     sys.exit(1)
 
-ZV_VERSION = 11
+ZV_VERSIONS = (11, 13, 15)   # 11 = legacy AC, 13 = rANS, 15 = tile program
 
 _LIB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "libzv_core.dylib")
 _LIB = ctypes.CDLL(_LIB_PATH)
 
 _LIB.ycocgr_to_rgb_frame.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
 _LIB.ycocgr_to_rgb_frame.restype = None
-_LIB.zv_decode_plane_stripe.argtypes = [
-    ctypes.c_void_p, ctypes.c_void_p,
+for _fn in ("zv_decode_plane_stripe", "zv_decode_plane_stripe_v2", "zv_decode_plane_stripe_v3"):
+    _f = getattr(_LIB, _fn)
+    _f.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p,
+        ctypes.c_int, ctypes.c_int,
+        ctypes.c_void_p, ctypes.c_int32,
+    ]
+    _f.restype = ctypes.c_int32
+_LIB.zv_decode_plane_stripe_v3.argtypes = [
+    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
     ctypes.c_int, ctypes.c_int,
     ctypes.c_void_p, ctypes.c_int32,
 ]
-_LIB.zv_decode_plane_stripe.restype = ctypes.c_int32
+
+def _decode_stripe_fn(ver):
+    if ver == 11: return _LIB.zv_decode_plane_stripe
+    if ver == 13: return _LIB.zv_decode_plane_stripe_v2
+    return _LIB.zv_decode_plane_stripe_v3
 
 def ycocgr_to_rgb(yY: np.ndarray, yCo: np.ndarray, yCg: np.ndarray) -> np.ndarray:
     h, w = yY.shape
@@ -63,8 +75,9 @@ def decode(input_path: str, output_path=None, playback: bool = True):
         if f.read(2) != b"ZV":
             print("not a ZV file"); sys.exit(1)
         ver = f.read(1)[0]
-        if ver != ZV_VERSION:
-            print(f"unsupported version: {ver} (expected {ZV_VERSION})"); sys.exit(1)
+        if ver not in ZV_VERSIONS:
+            print(f"unsupported version: {ver} (expected one of {ZV_VERSIONS})"); sys.exit(1)
+        decode_stripe = _decode_stripe_fn(ver)
         w, h = struct.unpack(">HH", f.read(4))
         fps = f.read(1)[0]
         fc, = struct.unpack(">I", f.read(4))
@@ -102,6 +115,8 @@ def decode(input_path: str, output_path=None, playback: bool = True):
                     sl, = struct.unpack(">I", buf[pos:pos+4]); pos += 4
                     stripe_payloads[plane_id][sid] = bytes(buf[pos:pos+sl]); pos += sl
 
+            v15 = (decode_stripe == _LIB.zv_decode_plane_stripe_v3)
+
             def dec_task(plane_id, sid):
                 payload = stripe_payloads[plane_id][sid]
                 y0, sh = stripes[sid]
@@ -110,18 +125,27 @@ def decode(input_path: str, output_path=None, playback: bool = True):
                 cur_offset = y0 * w
                 cur_ptr = cur_p.ctypes.data + cur_offset * 2
                 prev_ptr = (prev_p.ctypes.data + cur_offset * 2) if prev_p is not None else 0
+                luma_ptr = (cur_Y.ctypes.data + cur_offset * 2) if plane_id else 0
                 in_buf = (ctypes.c_uint8 * len(payload)).from_buffer_copy(payload)
-                _LIB.zv_decode_plane_stripe(
-                    ctypes.c_void_p(prev_ptr), ctypes.c_void_p(cur_ptr),
-                    w, sh, ctypes.cast(in_buf, ctypes.c_void_p), len(payload),
-                )
+                if v15:
+                    decode_stripe(
+                        ctypes.c_void_p(prev_ptr), ctypes.c_void_p(cur_ptr),
+                        ctypes.c_void_p(luma_ptr),
+                        w, sh, ctypes.cast(in_buf, ctypes.c_void_p), len(payload),
+                    )
+                else:
+                    decode_stripe(
+                        ctypes.c_void_p(prev_ptr), ctypes.c_void_p(cur_ptr),
+                        w, sh, ctypes.cast(in_buf, ctypes.c_void_p), len(payload),
+                    )
 
-            futs = []
+            # chroma CfL reads decoded luma: decode planes in order, stripes
+            # of one plane still parallel
             for plane_id in range(3):
-                for sid in range(n_real):
-                    futs.append(decoder_pool.submit(dec_task, plane_id, sid))
-            for ft in futs:
-                ft.result()
+                futs = [decoder_pool.submit(dec_task, plane_id, sid)
+                        for sid in range(n_real)]
+                for ft in futs:
+                    ft.result()
 
             rgb = ycocgr_to_rgb(cur_Y, cur_Co, cur_Cg)
             bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)

@@ -59,6 +59,27 @@ LIB.rgb_to_ycocgr_frame.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_i
 LIB.rgb_to_ycocgr_frame.restype = None
 LIB.ycocgr_to_rgb_frame.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
 LIB.ycocgr_to_rgb_frame.restype = None
+LIB.rgb_to_ycocgr_full_frame.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+LIB.rgb_to_ycocgr_full_frame.restype = None
+LIB.ycocgr_to_rgb_full_frame.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+LIB.ycocgr_to_rgb_full_frame.restype = None
+LIB.ycocgr_to_rgb16_full_frame.argtypes = [
+    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+LIB.ycocgr_to_rgb16_full_frame.restype = None
+LIB.zv_encode_set_stripes.argtypes = [ctypes.c_int]
+LIB.zv_encode_set_stripes.restype = None
+LIB.zv_encode_get_stripes.argtypes = []
+LIB.zv_encode_get_stripes.restype = ctypes.c_int
+LIB.zv3_state_size.argtypes = [ctypes.c_int, ctypes.c_int]
+LIB.zv3_state_size.restype = ctypes.c_int32
+LIB.zv3_state_init.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+LIB.zv3_state_init.restype = None
+LIB.zv_encode_frame_v3s.argtypes = [
+    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
+    ctypes.c_void_p, ctypes.c_int32, ctypes.c_void_p]
+LIB.zv_encode_frame_v3s.restype = ctypes.c_int32
+LIB.zv_decode_frame_v3s.argtypes = LIB.zv_encode_frame_v3s.argtypes[:]
+LIB.zv_decode_frame_v3s.restype = ctypes.c_int32
 LIB.zv_encode_frame.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
                                 ctypes.c_void_p, ctypes.c_int32]
 LIB.zv_encode_frame.restype = ctypes.c_int32
@@ -71,21 +92,36 @@ LIB.zv_encode_plane_stripe.restype = ctypes.c_int32
 LIB.zv_decode_plane_stripe.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
                                        ctypes.c_void_p, ctypes.c_int32]
 LIB.zv_decode_plane_stripe.restype = ctypes.c_int32
+for _fn in ("zv_encode_frame_v2", "zv_decode_frame_v2",
+            "zv_encode_plane_stripe_v2", "zv_decode_plane_stripe_v2",
+            "zv_encode_frame_v3", "zv_decode_frame_v3"):
+    _f = getattr(LIB, _fn)
+    _f.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
+                   ctypes.c_void_p, ctypes.c_int32]
+    _f.restype = ctypes.c_int32
+for _fn in ("zv_encode_plane_stripe_v3", "zv_decode_plane_stripe_v3"):
+    _f = getattr(LIB, _fn)
+    _f.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                   ctypes.c_int, ctypes.c_int,
+                   ctypes.c_void_p, ctypes.c_int32]
+    _f.restype = ctypes.c_int32
 
 
-def rgb_to_ycocgr(rgb):
+def rgb_to_ycocgr(rgb, full=True):
     h, w, _ = rgb.shape
     out = np.empty((h, w, 3), dtype=np.int16)
-    LIB.rgb_to_ycocgr_frame(rgb.ctypes.data_as(ctypes.c_void_p),
-                            out.ctypes.data_as(ctypes.c_void_p), w, h)
+    fn = LIB.rgb_to_ycocgr_full_frame if full else LIB.rgb_to_ycocgr_frame
+    fn(rgb.ctypes.data_as(ctypes.c_void_p),
+       out.ctypes.data_as(ctypes.c_void_p), w, h)
     return out
 
 
-def ycocgr_to_rgb(yc):
+def ycocgr_to_rgb(yc, full=False):
     h, w, _ = yc.shape
     out = np.empty((h, w, 3), dtype=np.uint8)
-    LIB.ycocgr_to_rgb_frame(yc.ctypes.data_as(ctypes.c_void_p),
-                            out.ctypes.data_as(ctypes.c_void_p), w, h)
+    fn = LIB.ycocgr_to_rgb_full_frame if full else LIB.ycocgr_to_rgb_frame
+    fn(yc.ctypes.data_as(ctypes.c_void_p),
+       out.ctypes.data_as(ctypes.c_void_p), w, h)
     return out
 
 
@@ -111,13 +147,21 @@ def stripe_boundaries(h, n, align=16):
 class ZVReader:
     def __init__(self, path):
         self.path = path
-        self.f = open(path, "rb")
+        self.audio = None
+        from zv_mux import is_zvm, unpack
+        if is_zvm(path):
+            with open(path, "rb") as raw:
+                video, self.audio = unpack(raw.read())
+            import io
+            self.f = io.BytesIO(video)
+        else:
+            self.f = open(path, "rb")
         magic = self.f.read(2)
         if magic != b"ZV":
             self.f.close()
             raise ValueError("not a ZV file")
         self.version = self.f.read(1)[0]
-        if self.version not in (10, 11):
+        if self.version not in (10, 11, 12, 13, 14, 15, 16, 17, 18):
             self.f.close()
             raise ValueError(f"unsupported ZV version: {self.version}")
         self.w, self.h = struct.unpack(">HH", self.f.read(4))
@@ -147,9 +191,16 @@ class ZVDecoder:
         self.r = reader
         self.w, self.h = reader.w, reader.h
         self.version = reader.version
-        if self.version == 10:
+        self.full_color = self.version >= 17
+        self.depth10 = self.version >= 18
+        self.stateful = self.version in (16, 17, 18)
+        if self.version in (10, 12, 14, 16, 17, 18):
             self.cur = np.zeros((self.h, self.w, 3), dtype=np.int16)
             self.prev = None
+            self.dec_state = None
+            if self.stateful:
+                self.dec_state = (ctypes.c_uint8 * LIB.zv3_state_size(self.w, self.h))()
+                LIB.zv3_state_init(self.dec_state, self.w, self.h)
         else:
             self.cur_Y = np.zeros((self.h, self.w), dtype=np.int16)
             self.cur_Co = np.zeros((self.h, self.w), dtype=np.int16)
@@ -159,8 +210,10 @@ class ZVDecoder:
         self.last_idx = -1
 
     def reset(self):
-        if self.version == 10:
+        if self.version in (10, 12, 14, 16, 17, 18):
             self.prev = None
+            if self.stateful and self.dec_state is not None:
+                LIB.zv3_state_init(self.dec_state, self.w, self.h)
         else:
             self.prev_Y = self.prev_Co = self.prev_Cg = None
         self.last_idx = -1
@@ -169,13 +222,30 @@ class ZVDecoder:
         buf = self.r.read_payload(idx)
         in_buf = (ctypes.c_uint8 * len(buf)).from_buffer_copy(buf)
         prev_ptr = self.prev.ctypes.data_as(ctypes.c_void_p) if self.prev is not None else None
-        LIB.zv_decode_frame(prev_ptr, self.cur.ctypes.data_as(ctypes.c_void_p),
-                            self.w, self.h, ctypes.cast(in_buf, ctypes.c_void_p), len(buf))
+        if self.stateful:
+            LIB.zv_decode_frame_v3s(
+                prev_ptr, self.cur.ctypes.data_as(ctypes.c_void_p),
+                self.w, self.h, ctypes.cast(in_buf, ctypes.c_void_p), len(buf),
+                self.dec_state)
+        else:
+            dec_frame = (LIB.zv_decode_frame if self.version == 10 else
+                         LIB.zv_decode_frame_v2 if self.version == 12 else
+                         LIB.zv_decode_frame_v3)
+            dec_frame(prev_ptr, self.cur.ctypes.data_as(ctypes.c_void_p),
+                      self.w, self.h, ctypes.cast(in_buf, ctypes.c_void_p), len(buf))
         if self.prev is None:
             self.prev = self.cur.copy()
         else:
             np.copyto(self.prev, self.cur)
-        return ycocgr_to_rgb(self.cur)
+        if self.depth10:
+            h, w, _ = self.cur.shape
+            out16 = np.empty((h, w, 3), dtype=np.uint16)
+            LIB.ycocgr_to_rgb16_full_frame(
+                self.cur.ctypes.data_as(ctypes.c_void_p),
+                out16.ctypes.data_as(ctypes.c_void_p),
+                w, h, 1023)
+            return np.clip(out16 >> 2, 0, 255).astype(np.uint8)
+        return ycocgr_to_rgb(self.cur, full=self.full_color)
 
     def _decode_v11(self, idx):
         buf = self.r.read_payload(idx)
@@ -189,6 +259,8 @@ class ZVDecoder:
                 sl, = struct.unpack(">I", buf[pos:pos + 4]); pos += 4
                 plane_payloads[plane_id][sid] = bytes(buf[pos:pos + sl]); pos += sl
 
+        v15 = (self.version == 15)
+
         def task(plane_id, sid):
             payload = plane_payloads[plane_id][sid]
             y0, sh = stripes[sid]
@@ -197,13 +269,26 @@ class ZVDecoder:
             cur_offset = y0 * self.w
             cur_ptr = cur_p.ctypes.data + cur_offset * 2
             prev_ptr = (prev_p.ctypes.data + cur_offset * 2) if prev_p is not None else 0
+            luma_ptr = (self.cur_Y.ctypes.data + cur_offset * 2) if plane_id else 0
             in_buf = (ctypes.c_uint8 * len(payload)).from_buffer_copy(payload)
-            LIB.zv_decode_plane_stripe(ctypes.c_void_p(prev_ptr), ctypes.c_void_p(cur_ptr),
-                                       self.w, sh, ctypes.cast(in_buf, ctypes.c_void_p), len(payload))
+            dec_stripe = (LIB.zv_decode_plane_stripe if self.version == 11 else
+                      LIB.zv_decode_plane_stripe_v2 if self.version == 13 else
+                      LIB.zv_decode_plane_stripe_v3)
+            if v15:
+                dec_stripe(ctypes.c_void_p(prev_ptr), ctypes.c_void_p(cur_ptr),
+                           ctypes.c_void_p(luma_ptr),
+                           self.w, sh, ctypes.cast(in_buf, ctypes.c_void_p),
+                           len(payload))
+            else:
+                dec_stripe(ctypes.c_void_p(prev_ptr), ctypes.c_void_p(cur_ptr),
+                           self.w, sh, ctypes.cast(in_buf, ctypes.c_void_p),
+                           len(payload))
 
-        futs = [self.pool.submit(task, p, s) for p in range(3) for s in range(n_real)]
-        for ft in futs:
-            ft.result()
+        # v15 chroma CfL needs decoded luma: planes in order, stripes parallel
+        for p in range(3):
+            futs = [self.pool.submit(task, p, s) for s in range(n_real)]
+            for ft in futs:
+                ft.result()
 
         if self.prev_Y is None:
             self.prev_Y = self.cur_Y.copy()
@@ -218,28 +303,28 @@ class ZVDecoder:
         yc[..., 0] = self.cur_Y
         yc[..., 1] = self.cur_Co
         yc[..., 2] = self.cur_Cg
-        return ycocgr_to_rgb(yc)
+        return ycocgr_to_rgb(yc, full=False)
 
     def decode_to(self, target):
         if target < self.last_idx:
             self.reset()
         while self.last_idx < target:
             self.last_idx += 1
-            if self.version == 10:
+            if self.version in (10, 12, 14, 16, 17, 18):
                 rgb = self._decode_v10(self.last_idx)
             else:
                 rgb = self._decode_v11(self.last_idx)
         return rgb
 
     def close(self):
-        if self.version == 11:
+        if self.version in (11, 13, 15):
             try:
                 self.pool.shutdown(wait=False)
             except Exception:
                 pass
 
 
-def encode_video_to_zv(input_path, output_path, n_stripes=8,
+def encode_video_to_zv(input_path, output_path, n_stripes=3,
                       progress_cb=None, abort_flag=None):
     if cv2 is None:
         raise RuntimeError("opencv-python not installed: pip install opencv-python")
@@ -255,18 +340,10 @@ def encode_video_to_zv(input_path, output_path, n_stripes=8,
     if fps > 240: fps = 240
     fc = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-    use_mt = n_stripes > 1
-    version = 11 if use_mt else 10
-
-    if use_mt:
-        stripes = stripe_boundaries(h, n_stripes)
-        n_real = len(stripes)
-        pool = ThreadPoolExecutor(max_workers=max(8, n_real * 3))
-    else:
-        n_real = 1
-        pool = None
-        max_frame_bytes = 8 * w * h + 4096
-        out_buf = (ctypes.c_uint8 * max_frame_bytes)()
+    version = 17
+    LIB.zv_encode_set_stripes(max(1, int(n_stripes)))
+    max_frame_bytes = 8 * w * h + 65536
+    out_buf = (ctypes.c_uint8 * max_frame_bytes)()
 
     sizes = []
     fi = 0
@@ -275,7 +352,8 @@ def encode_video_to_zv(input_path, output_path, n_stripes=8,
     t0 = time.time()
 
     prev_ycocg = None
-    prev_Y = prev_Co = prev_Cg = None
+    enc_state = (ctypes.c_uint8 * LIB.zv3_state_size(w, h))()
+    LIB.zv3_state_init(enc_state, w, h)
 
     with open(output_path, "wb") as fout:
         fout.write(b"ZV")
@@ -295,60 +373,21 @@ def encode_video_to_zv(input_path, output_path, n_stripes=8,
             if not ok:
                 break
             rgb = cv2.cvtColor(frm, cv2.COLOR_BGR2RGB)
-            cur_yc = rgb_to_ycocgr(rgb)
+            cur_yc = rgb_to_ycocgr(rgb, full=True)
             del rgb, frm
 
-            if not use_mt:
-                prev_ptr = prev_ycocg.ctypes.data_as(ctypes.c_void_p) if prev_ycocg is not None else None
-                n = LIB.zv_encode_frame(prev_ptr, cur_yc.ctypes.data_as(ctypes.c_void_p),
-                                        w, h, out_buf, max_frame_bytes)
-                if n <= 0:
-                    raise RuntimeError(f"encode failed at frame {fi}")
-                fout.write(bytes(out_buf[:n]))
-                sizes.append(int(n))
-                total_bytes += n
-                if prev_ycocg is None:
-                    prev_ycocg = cur_yc.copy()
-                else:
-                    np.copyto(prev_ycocg, cur_yc)
+            prev_ptr = prev_ycocg.ctypes.data_as(ctypes.c_void_p) if prev_ycocg is not None else None
+            n = LIB.zv_encode_frame_v3s(prev_ptr, cur_yc.ctypes.data_as(ctypes.c_void_p),
+                                        w, h, out_buf, max_frame_bytes, enc_state)
+            if n <= 0:
+                raise RuntimeError(f"encode failed at frame {fi}")
+            fout.write(bytes(out_buf[:n]))
+            sizes.append(int(n))
+            total_bytes += n
+            if prev_ycocg is None:
+                prev_ycocg = cur_yc.copy()
             else:
-                cur_Y = np.ascontiguousarray(cur_yc[..., 0])
-                cur_Co = np.ascontiguousarray(cur_yc[..., 1])
-                cur_Cg = np.ascontiguousarray(cur_yc[..., 2])
-                del cur_yc
-
-                results = {}
-
-                def enc_task(plane_id, sid, prev_p, cur_p, y0, sh):
-                    cur_offset = y0 * w
-                    cur_ptr = cur_p.ctypes.data + cur_offset * 2
-                    prev_ptr = (prev_p.ctypes.data + cur_offset * 2) if prev_p is not None else 0
-                    max_buf = 4 * w * sh + 4096
-                    out_buf_local = (ctypes.c_uint8 * max_buf)()
-                    n = LIB.zv_encode_plane_stripe(ctypes.c_void_p(prev_ptr), ctypes.c_void_p(cur_ptr),
-                                                   w, sh, out_buf_local, max_buf)
-                    results[(plane_id, sid)] = bytes(out_buf_local[:n])
-
-                futs = []
-                planes = [(prev_Y, cur_Y), (prev_Co, cur_Co), (prev_Cg, cur_Cg)]
-                for plane_id, (prev_p, cur_p) in enumerate(planes):
-                    for sid, (y0, sh) in enumerate(stripes):
-                        futs.append(pool.submit(enc_task, plane_id, sid, prev_p, cur_p, y0, sh))
-                for ft in futs:
-                    ft.result()
-
-                frame_buf = bytearray()
-                frame_buf.append(0)
-                frame_buf.append(n_real)
-                for plane_id in range(3):
-                    for sid in range(n_real):
-                        p = results[(plane_id, sid)]
-                        frame_buf.extend(struct.pack(">I", len(p)))
-                        frame_buf.extend(p)
-                fout.write(bytes(frame_buf))
-                sizes.append(len(frame_buf))
-                total_bytes += len(frame_buf)
-                prev_Y, prev_Co, prev_Cg = cur_Y, cur_Co, cur_Cg
+                np.copyto(prev_ycocg, cur_yc)
 
             fi += 1
             if progress_cb is not None:
@@ -366,8 +405,6 @@ def encode_video_to_zv(input_path, output_path, n_stripes=8,
             fout.truncate(payload_end)
 
     cap.release()
-    if pool is not None:
-        pool.shutdown()
 
     return {
         "frames": fi,
@@ -377,6 +414,7 @@ def encode_video_to_zv(input_path, output_path, n_stripes=8,
         "bytes": total_bytes,
         "elapsed": time.time() - t0,
         "aborted": aborted,
+        "stripes": LIB.zv_encode_get_stripes(),
     }
 
 
@@ -561,7 +599,7 @@ class ConverterTab(ttk.Frame):
         opts = ttk.Frame(self)
         opts.pack(fill="x", padx=8, pady=4)
         ttk.Label(opts, text="Stripes (1 = single-thread v10, 8 = multi-thread v11):").pack(side="left")
-        self.stripes_var = tk.IntVar(value=8)
+        self.stripes_var = tk.IntVar(value=3)
         sp = ttk.Spinbox(opts, from_=1, to=32, textvariable=self.stripes_var, width=5)
         sp.pack(side="left", padx=8)
 

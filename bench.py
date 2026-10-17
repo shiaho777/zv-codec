@@ -7,18 +7,43 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from encoder import _LIB, rgb_to_ycocgr
 from decoder import ycocgr_to_rgb
 
-_LIB.zv_encode_frame.argtypes = [
+for _fn in ("zv_encode_frame", "zv_decode_frame",
+            "zv_encode_frame_v2", "zv_decode_frame_v2",
+            "zv_encode_frame_v3", "zv_decode_frame_v3"):
+    _f = getattr(_LIB, _fn)
+    _f.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p,
+        ctypes.c_int, ctypes.c_int,
+        ctypes.c_void_p, ctypes.c_int32,
+    ]
+    _f.restype = ctypes.c_int32
+
+_LIB.zv_encode_frame_v3s.argtypes = [
     ctypes.c_void_p, ctypes.c_void_p,
     ctypes.c_int, ctypes.c_int,
-    ctypes.c_void_p, ctypes.c_int32,
+    ctypes.c_void_p, ctypes.c_int32, ctypes.c_void_p,
 ]
-_LIB.zv_encode_frame.restype = ctypes.c_int32
-_LIB.zv_decode_frame.argtypes = [
-    ctypes.c_void_p, ctypes.c_void_p,
-    ctypes.c_int, ctypes.c_int,
-    ctypes.c_void_p, ctypes.c_int32,
+_LIB.zv_encode_frame_v3s.restype = ctypes.c_int32
+_LIB.zv_decode_frame_v3s.argtypes = _LIB.zv_encode_frame_v3s.argtypes[:]
+_LIB.zv_decode_frame_v3s.restype = ctypes.c_int32
+_LIB.zv3_state_size.argtypes = [ctypes.c_int, ctypes.c_int]
+_LIB.zv3_state_size.restype = ctypes.c_int32
+_LIB.zv3_state_init.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+_LIB.zv3_state_init.restype = None
+
+ENC_FN = _LIB.zv_encode_frame_v3
+DEC_FN = _LIB.zv_decode_frame_v3
+ZV_VER = 14
+ZV_MODES = [
+    ("ZV v16 stateful", _LIB.zv_encode_frame_v3s, _LIB.zv_decode_frame_v3s, 16),
+    ("ZV v14",          _LIB.zv_encode_frame_v3,  _LIB.zv_decode_frame_v3,  14),
 ]
-_LIB.zv_decode_frame.restype = ctypes.c_int32
+
+
+def _new_state(w, h):
+    st = (ctypes.c_uint8 * _LIB.zv3_state_size(w, h))()
+    _LIB.zv3_state_init(st, w, h)
+    return st
 
 FFMPEG = shutil.which("ffmpeg") or "/opt/homebrew/bin/ffmpeg"
 
@@ -47,17 +72,18 @@ def read_frame_from_raw(f, w, h):
         return None
     return np.frombuffer(buf, dtype=np.uint8).reshape(h, w, 3)
 
-def zv_encode_stream(raw_path, zv_path, w, h, fc, fps):
-    max_frame_bytes = 8 * w * h + 4096
+def zv_encode_stream(raw_path, zv_path, w, h, fc, fps, enc_fn, ver):
+    max_frame_bytes = 8 * w * h + 65536
     out_buf = (ctypes.c_uint8 * max_frame_bytes)()
+    state = _new_state(w, h) if ver == 16 else None
     prev_yc = None
     sizes = []
     t0 = time.time()
     with open(raw_path, "rb") as fin, open(zv_path, "wb") as fout:
-                       
-        fout.write(b"ZV" + bytes([10]) + struct.pack(">HH", w, h)
+
+        fout.write(b"ZV" + bytes([ver]) + struct.pack(">HH", w, h)
                    + bytes([fps & 0xFF]) + struct.pack(">I", fc))
-                                                                      
+
         size_table_off = fout.tell()
         fout.write(b"\x00" * (fc * 4))
 
@@ -68,10 +94,16 @@ def zv_encode_stream(raw_path, zv_path, w, h, fc, fps):
             cur_yc = rgb_to_ycocgr(rgb)
             del rgb
             prev_ptr = prev_yc.ctypes.data_as(ctypes.c_void_p) if prev_yc is not None else None
-            n = _LIB.zv_encode_frame(
-                prev_ptr, cur_yc.ctypes.data_as(ctypes.c_void_p),
-                w, h, out_buf, max_frame_bytes,
-            )
+            if state is not None:
+                n = enc_fn(
+                    prev_ptr, cur_yc.ctypes.data_as(ctypes.c_void_p),
+                    w, h, out_buf, max_frame_bytes, state,
+                )
+            else:
+                n = enc_fn(
+                    prev_ptr, cur_yc.ctypes.data_as(ctypes.c_void_p),
+                    w, h, out_buf, max_frame_bytes,
+                )
             fout.write(bytes(out_buf[:n]))
             sizes.append(n)
             prev_yc = cur_yc
@@ -81,15 +113,16 @@ def zv_encode_stream(raw_path, zv_path, w, h, fc, fps):
             fout.write(struct.pack(">I", sz))
     return time.time() - t0, sum(sizes)
 
-def zv_decode_and_verify(zv_path, raw_path, w, h, fc):
+def zv_decode_and_verify(zv_path, raw_path, w, h, fc, dec_fn, ver):
     curr_yc = np.zeros((h, w, 3), dtype=np.int16)
+    state = _new_state(w, h) if ver == 16 else None
     prev_yc = None
     t0 = time.time()
     mismatches = 0
     first_bad = None
     with open(zv_path, "rb") as fzv, open(raw_path, "rb") as fraw:
-        assert fzv.read(3) == b"ZV\x0a"
-        fzv.read(2 + 2 + 1 + 4)              
+        assert fzv.read(3) == b"ZV" + bytes([ver])
+        fzv.read(2 + 2 + 1 + 4)
         sizes = [struct.unpack(">I", fzv.read(4))[0] for _ in range(fc)]
 
         for fi in range(fc):
@@ -97,10 +130,17 @@ def zv_decode_and_verify(zv_path, raw_path, w, h, fc):
             in_buf = (ctypes.c_uint8 * len(buf)).from_buffer_copy(buf)
             del buf
             prev_ptr = prev_yc.ctypes.data_as(ctypes.c_void_p) if prev_yc is not None else None
-            _LIB.zv_decode_frame(
-                prev_ptr, curr_yc.ctypes.data_as(ctypes.c_void_p),
-                w, h, ctypes.cast(in_buf, ctypes.c_void_p), len(in_buf),
-            )
+            if state is not None:
+                dec_fn(
+                    prev_ptr, curr_yc.ctypes.data_as(ctypes.c_void_p),
+                    w, h, ctypes.cast(in_buf, ctypes.c_void_p), len(in_buf),
+                    state,
+                )
+            else:
+                dec_fn(
+                    prev_ptr, curr_yc.ctypes.data_as(ctypes.c_void_p),
+                    w, h, ctypes.cast(in_buf, ctypes.c_void_p), len(in_buf),
+                )
             dec_rgb = ycocgr_to_rgb(curr_yc)
             orig_rgb = read_frame_from_raw(fraw, w, h)
             if not np.array_equal(dec_rgb, orig_rgb):
@@ -155,7 +195,7 @@ def ffmpeg_decode_and_compare(codec_out_path, raw_path, w, h, fc):
     return first_bad is None, first_bad, max_diff
 
 CODECS = [
-    ("ZV v10",             None),                  
+    ("ZV v14",             None),                  
     ("FFV1",               ["-c:v", "ffv1", "-level", "3", "-coder", "1",
                             "-context", "1", "-g", "1", "-slices", "24",
                             "-slicecrc", "1"]),
@@ -201,19 +241,23 @@ def main():
     results = []                                                  
 
     if only is None or "zv" in only:
-        print("[ZV] encoding ...", flush=True)
-        zv_path = os.path.join(tempfile.gettempdir(), "bench.zv")
-        enc_t, zv_size = zv_encode_stream(raw_path, zv_path, w, h, fc, fps)
-        print("[ZV] decoding+verifying ...", flush=True)
-        dec_t, mism, first_bad = zv_decode_and_verify(zv_path, raw_path, w, h, fc)
-        is_lossless = (mism == 0)
-        extra = f"dec {fc/dec_t:.0f} fps"
-        results.append(("ZV v10", zv_size, enc_t, is_lossless, 0 if is_lossless else -1, extra))
-        if not keep:
-            try: os.unlink(zv_path)
-            except OSError: pass
-        print(f"[ZV] done: {zv_size:,} B, enc {enc_t:.2f}s, dec {dec_t:.2f}s, "
-              f"lossless={is_lossless}", flush=True)
+        for label, enc_fn, dec_fn, ver in ZV_MODES:
+            print(f"[{label}] encoding ...", flush=True)
+            zv_path = os.path.join(tempfile.gettempdir(), f"bench_v{ver}.zv")
+            enc_t, zv_size = zv_encode_stream(raw_path, zv_path, w, h, fc, fps,
+                                             enc_fn, ver)
+            print(f"[{label}] decoding+verifying ...", flush=True)
+            dec_t, mism, first_bad = zv_decode_and_verify(
+                zv_path, raw_path, w, h, fc, dec_fn, ver)
+            is_lossless = (mism == 0)
+            extra = f"dec {fc/dec_t:.0f} fps"
+            results.append((label, zv_size, enc_t, is_lossless,
+                            0 if is_lossless else -1, extra))
+            if not keep:
+                try: os.unlink(zv_path)
+                except OSError: pass
+            print(f"[{label}] done: {zv_size:,} B, enc {enc_t:.2f}s, "
+                  f"dec {dec_t:.2f}s, lossless={is_lossless}", flush=True)
 
     for name, args in CODECS[1:]:
         if only is not None and name.split()[0].lower() not in only:
@@ -250,7 +294,7 @@ def main():
         bpp = size * 8 / (fc * w * h)
         status = "YES" if lossless else f"NO(d<={md})"
         delta = ""
-        if zv_ref is not None and name != "ZV v10":
+        if zv_ref is not None and not name.startswith("ZV"):
             p = (size - zv_ref) / zv_ref * 100
             delta = f"{'+' if p>=0 else ''}{p:.0f}%"
         print(f"{name:<22}{size:>15,}{ratio:>8.1f}x{bpp:>8.3f}{t:>9.2f}  {status:<14}{delta:<10}")
