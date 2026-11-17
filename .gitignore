@@ -13,6 +13,15 @@ __pycache__/
 *.dll
 *.o
 *.a
+*.dSYM/
+
+# local scratch / benchmark data and debug logs
+_tmp/
+bench_data/
+*.log
+*.rgb
+*.profraw
+*.profdata
 
 # personal test assets
 *.mov
