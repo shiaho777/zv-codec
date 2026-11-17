@@ -191,10 +191,13 @@ Two payload variants share the same outer header:
   Exact ops (`RUN`/`MVRUN`/`PAL`/`RAW`/`RPT`) are unaffected.
   Lossy chroma starts at `2*qs` (capped by `qs_hi`); per-tile `OP_QS`
   may coarsen further, but a lossy plane never re-opens `qs=1` (that
-  made high-eps files larger than mid-eps). Screen content still has a
+  made high-eps files larger than mid-eps). When every 2×2 stays inside
+  the YCoCg error bound, lossy chroma is coded as `PHDR_C420` (quarter
+  res, decoder already replicates). Screen content still has a
   frame-level lossless sibling when it is strictly smaller.
-  `OP_TX` / `OP_TXI` (reversible 4/8/16 Haar, luma only, CFL_MDL
-  coefficients) compete with residual leaves in the 0.25–4 bpp band.
+  `OP_TX` / `OP_TXI` (reversible 4/8/16 Haar, CFL_MDL coefficients)
+  compete with residual leaves in the 0.25–4 bpp band; lossless chroma
+  stays off Haar so CfL is not mixed.
 - v15 (multi-stripe): the stripe variant of v14.
 - v16 (stateful): v14 plus per-plane persistent decoder state carried
   across frames — leaf-descriptor tables (enabling `PSAME`/`VRPT`
@@ -242,9 +245,9 @@ Same clip, 8 frames, near-lossless (Apple M4 Pro). Rate is monotonic in `eps`:
 | Setting | Size | bpp | RGB PSNR | max\|dRGB\| |
 |---------|------|-----|----------|-------------|
 | eps=0 | 1.85 MB | 2.010 | lossless | 0 |
-| eps=1/4 | 339 KB | 0.368 | 40.11 dB | 13 |
-| eps=4/16 | 83 KB | 0.090 | 30.06 dB | 42 |
-| eps=8/32 | 40 KB | 0.044 | 25.03 dB | 74 |
+| eps=1/4 | 295 KB | 0.320 | 40.07 dB | 14 |
+| eps=4/16 | 75 KB | 0.082 | 30.14 dB | 44 |
+| eps=8/32 | 36 KB | 0.039 | 25.23 dB | 71 |
 
 Grain-heavy close-ups stay expensive for every lossless RGB codec (~12 bpp
 here). AV1 lossless YUV444 is still ~1.25× smaller than ZV RGB. Hardware
